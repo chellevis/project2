@@ -1,0 +1,207 @@
+---
+title: 'Project 2: Data Mining, Classification, Prediction'
+author: "SDS322E"
+date: ''
+output:
+  html_document:
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  pdf_document:
+    toc: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, fig.align = "center", warning = F, message = F,
+tidy=TRUE, tidy.opts=list(width.cutoff=60), R.options=list(max.print=100))
+
+class_diag  =  function(score, truth, positive, cutoff=.5){
+
+  pred  =  factor(score>cutoff,levels=c("TRUE","FALSE"))
+  truth  =  factor(truth==positive, levels=c("TRUE","FALSE"))
+
+  tab = table(truth, pred)
+  acc=sum(diag(tab))/sum(tab)
+  sens=tab[1,1]/rowSums(tab)[1]
+  spec=tab[2,2]/rowSums(tab)[2]
+  ppv=tab[1,1]/colSums(tab)[1]
+
+#CALCULATE F1
+  f1=2*(sens*ppv)/(sens+ppv)
+  
+#CALCULATE EXACT AUC
+  truth = as.numeric(truth=="TRUE")
+  ord = order(score, decreasing=TRUE)
+  score  =  score[ord]; truth  =  truth[ord]
+  TPR=cumsum(truth)/max(1,sum(truth))
+  FPR=cumsum(!truth)/max(1,sum(!truth))
+  dup = c(score[-1]>=score[-length(score)], FALSE)
+  TPR = c(0,TPR[!dup],1); FPR = c(0,FPR[!dup],1)
+  n  =  length(TPR)
+  auc =  sum( ((TPR[-1]+TPR[-n])/2) * (FPR[-1]-FPR[-n]) )
+  round(data.frame(acc,sens,spec,ppv,f1,ba=(sens+spec)/2,auc, row.names = "Metrics"),4)
+}
+```
+
+# Mining, Classification, Prediction
+
+## Chenyue Xu, EID: cx2436
+
+### Introduction 
+
+This dataset details affairs frequency and included data on _age_, _gender_, _yearsmarried_, _children_, and _occupation_, and was retrieved from https://vincentarelbundock.github.io/Rdatasets/datasets.html. This data set  was interesting because I wanted to investigate the predictors of infidelity. There are 601 observations, with two binary variables gender and children, and the rest of other variables are numerical.
+
+```{R}
+library(devtools)
+library(tidyverse)
+library(caret)
+library(pROC)
+library(cluster)
+library(factoextra)
+library(NbClust)
+library(ggbiplot)
+library(MLmetrics)
+library(foreign)
+library(MASS)
+library(GGally)
+set.seed(12345)
+```
+
+
+```{R}
+affair_df = read.csv("/stor/home/cx2436/homepage/project2/Affairs.csv")
+affair_df  =  na.omit(affair_df)
+affair_df  =  subset(affair_df, select = -c(X))
+affair_df$children = as.integer(as.factor(affair_df$children))
+affair_df$gender = as.integer(as.factor(affair_df$gender))
+#recoding
+affair_df  =  affair_df %>% 
+    mutate(children = recode(children, 
+                      '1' = '0', 
+                      '2' = '1')) %>%
+    mutate(gender = recode(gender, 
+                      '1' = '0', 
+                      '2' = '1'))
+affair_df$children = as.integer((affair_df$children))
+affair_df$gender = as.integer((affair_df$gender))
+
+original_df = affair_df
+```
+
+### Cluster Analysis
+
+```{R}
+#Pam clustering for age
+scaled_df_age = scale(affair_df$age)
+fviz_nbclust(scaled_df_age, pam, method = "silhouette")
+pam_age = pam(affair_df$age, k = 9)
+
+#Pam clustering for religousness
+scaled_df_religion = scale(affair_df$religiousness)
+fviz_nbclust(scaled_df_religion, pam, method = "silhouette")
+pam_relgiousness = pam(affair_df$religiousness, k = 5)
+
+#Pam clustering for affairs number
+scaled_df_affairs = scale(affair_df$affairs)
+fviz_nbclust(scaled_df_affairs, pam, method = "silhouette")
+pam_affairs = pam(affair_df$affairs, k = 6)
+
+#Assigning clustering variables
+affair_df$pam_age_cluster = as.factor(pam_age$cluster)
+affair_df$pam_relgiousness_cluster = as.factor(pam_relgiousness$cluster)
+affair_df$pam_affairs_cluster = as.factor(pam_affairs$cluster)
+
+viz_pairs = function(cluster_lamb){
+  for(i in 2:(ncol(affair_df)-3)){
+    for(j in i:(ncol(affair_df)-3)){
+      if(i == j){
+        next
+      }
+      viz = ggpairs(affair_df, columns = c(i,j), cluster_lamb, legend = 3)
+      print(viz)
+    }
+  }
+}
+
+viz_pairs(ggplot2::aes(colour=pam_age_cluster))
+viz_pairs(ggplot2::aes(colour=pam_relgiousness_cluster))
+viz_pairs(ggplot2::aes(colour=pam_affairs_cluster))
+```
+
+After visualizing the data using ggpairs, I saw some surprising clustering and correlations. The PAM clustering along the affairs column showed a bimodal distribution where there are peaks at the extremes (0 affairs and 6+ affairs) and a strong right skew. It seems that with respect to gender, males tend to have more affairs in clusters 5, 6, and 2 which is between 1 and 3 affairs. In contrast, women tend not to have affairs, but the data shows that in cluster 3, women engage in more frequent affairs than men do. Affairs tend to correlate with age, yearsmarried, and surprisingly children! It is understandably negatively correlated with religiousness. The data set seems fairly robust with a strong correlation and clustering strength.
+    
+### Dimensionality Reduction with PCA
+
+```{R}
+affair_df.pca = prcomp(original_df, center = TRUE, scale. = TRUE)
+ggbiplot(affair_df.pca)
+```
+
+The combined explanatory power of PC1 and PC2 is .489. This would indicate that other dimensional components contribute a sizable portion of the embedding. The visualization shows that PC1 is primarily contributed by affairs, children, yearsmarried,and religiousness. The vectors indicate that those 4 are encoded in a similar vector space and constribute to the predictive power of one another. This same logic is applied to gender, occupation, and education which constribute heavily to PC2.
+
+###  Linear Classifier
+
+```{R}
+glm_fit = glm(children ~., data = original_df, family = "binomial")
+glm_predictions = predict(glm_fit, original_df)
+#In-sample ROC
+class_diag(glm_predictions, original_df$children, positive = 1)
+```
+
+```{R}
+train_ctrl = trainControl(method = "cv", number = 10, savePredictions = TRUE)
+CV_LM_fit = train(children~., data = original_df, method = "glm", trControl = train_ctrl, tuneLength = 0)
+CV_LM_probs = predict(CV_LM_fit, newdata = original_df)
+class_diag(CV_LM_probs, original_df$children, positive = 1)
+```
+
+As we can see from the the training vs k-fold results, there is overfitting. This is especially apparent by by running class_diag() on both the training set and k-fold. Linear regression yields 0.8103 accuracy and 0.8873 for in-domain accuracy and knowledge respectively. In contrast, k-fold yields 0.8403 accuracy and 0.8848 AUC for cross validation where k=10. This indicates there is a substantial gap between in-domain and out-of-domain predictive power. Since K-means cross validates across 10 folds, it tends to mitigate overfitting, thus indicating the importance of cross-validation.
+
+### Non-Parametric Classifier
+
+```{R}
+knnFit = knn3(children~., data = original_df)
+knn_probs = predict(knnFit, newdata = original_df)[,2]
+class_diag(knn_probs, original_df$children, positive = 1)
+```
+
+```{R}
+knn_CV_control = trainControl(method = "cv",number = 10, savePredictions = TRUE) 
+knn_CV_Fit = train(children~., data = original_df, method = "knn", trControl = knn_CV_control, preProcess = c("center","scale"), tuneLength = 0)
+knn_CV_probs = predict(knn_CV_Fit, newdata = original_df)
+class_diag(knn_CV_probs, original_df$children, positive = 1)
+```
+As shown in class_diag for each respective k-nearest-neighbor model, the accuracy, f1, and AUC are better in the non-CV model. This indicates that without CV the model makes more balanced, accurate, and holistic decision boundaries. Thus, there is no indication of overfitting.
+
+
+### Regression/Numeric Prediction
+
+```{R}
+rlmFit = rlm(affairs~., data=original_df)
+rlm_probs = predict(rlmFit, newdata=original_df)
+class_diag(rlm_probs, original_df$affairs, positive = 1)
+mse = MSE(rlm_probs, original_df$affairs)
+mse
+```
+
+```{R}
+regression_control = trainControl(method = "cv", number = 10, savePredictions = TRUE) 
+regression_fit = train(affairs ~ ., data = original_df, method = "rlm", trControl = regression_control, preProcess = c("center","scale"), tuneLength = 0)
+rlm_CV_probs = predict(regression_fit, newdata = original_df)
+class_diag(rlm_CV_probs, original_df$affairs, positive = 1)
+mse = MSE(rlm_CV_probs, original_df$affairs)
+mse
+```
+
+Robust linear models seems to fair the best against over fitting since it uses fits against ordinal squares. There is a no difference in accuracy with 0.9434. They also have very similar area under curve around 0.4728 which indicates that k-fold doesn't show an improvement. Thus, overfitting is not an issue with RLM.
+
+
+### Concluding Remarks
+
+Thank you so much for your patience :)
+
+
+
+
+
